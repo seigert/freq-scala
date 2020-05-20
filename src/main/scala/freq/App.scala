@@ -1,16 +1,13 @@
 package freq
 
-import java.nio.charset.StandardCharsets
+import java.nio.ByteBuffer
 
 import cats.effect._
 import cats.implicits._
 import com.monovore.decline._
 import com.monovore.decline.effect._
-import com.sun.xml.internal.fastinfoset.util.StringArray
 import fs2._
 import it.unimi.dsi.fastutil.bytes.ByteArrayList
-import it.unimi.dsi.fastutil.ints.Int2ObjectAVLTreeMap
-import it.unimi.dsi.fastutil.objects.{ Object2IntOpenHashMap, ObjectAVLTreeSet }
 
 object App extends CommandIOApp("freq", "Counts '[a-zA-Z]+' words in input", version = "0.1.0") {
   private val a = 'a'.toByte
@@ -23,34 +20,9 @@ object App extends CommandIOApp("freq", "Counts '[a-zA-Z]+' words in input", ver
       .use { blocker =>
         args
           .input[IO](blocker)
-          .through(words)
-          .fold(new Object2IntOpenHashMap[String]()) { (dict, word) =>
-            dict.put(word, dict.getOrDefault(word, 0) + 1)
-            dict
-          }
-          .map { dict =>
-            val words = new Int2ObjectAVLTreeMap[ObjectAVLTreeSet[String]]
-            dict.object2IntEntrySet().fastForEach { e =>
-              val key   = e.getIntValue
-              val value = e.getKey
-              val _ = words
-                .getOrDefault(key, new ObjectAVLTreeSet[String])
-                .add(value)
-            }
-            words
-          }
-          .flatMap { counts =>
-            Stream
-              .unfold(counts.int2ObjectEntrySet().iterator()) { entries =>
-                if (entries.hasPrevious) {
-                  val prev = entries.previous()
-                  (Stream.unfold(prev.getValue.iterator()) { values =>
-                    if (values.hasNext) ((prev.getIntKey, values.next()) -> values).some
-                    else none
-                  } -> entries).some
-                } else none
-              }
-              .flatten
+          .through(collect)
+          .flatMap { dict =>
+            Stream.fromIterator[IO](dict.drain)
           }
           .map {
             case (counter, word) => f"$counter%d $word%s%n"
@@ -62,35 +34,44 @@ object App extends CommandIOApp("freq", "Counts '[a-zA-Z]+' words in input", ver
       .as(ExitCode.Success)
   }
 
-  def words[F[_]]: Pipe[F, Byte, String] = { bytes =>
-    def bal2String(bytes: ByteArrayList): String = {
-      val arr = new Array[Byte](bytes.size())
-      bytes.toArray(arr)
-      bytes.clear()
+  def collect[F[_]]: Pipe[F, ByteBuffer, FrequencyDict] = { buffers =>
+    def loop(
+        s: Stream[F, ByteBuffer],
+        dict: FrequencyDict,
+        lastHash: Int,
+        lastWord: ByteArrayList
+    ): Pull[F, FrequencyDict, Unit] =
+      s.pull.uncons1.flatMap {
+        case None =>
+          if (lastWord.isEmpty) Pull.output1(dict)
+          else Pull.output1(dict.register(lastHash, lastWord.toArray(new Array[Byte](lastWord.size()))))
+        case Some(buffer -> nxt) =>
+          var hash = lastHash
+          val word = lastWord
 
-      new String(arr, StandardCharsets.UTF_8)
-    }
+          while (buffer.remaining() > 0) {
+            if (buffer.remaining() % (1024 * 1024) == 0) {
+            }
 
-    def loop(s: Stream[F, Byte], rem: ByteArrayList): Pull[F, String, Unit] =
-      s.pull.uncons.flatMap {
-        case None if rem.isEmpty => Pull.done
-        case None                => Pull.output1(bal2String(rem))
-        case Some(chunk -> s) =>
-          val words = new StringArray()
-          val word  = rem
-          chunk.foreach { byte =>
+            var byte = buffer.get()
             if (a <= byte && byte <= z) {
-              val _ = word.add(byte)
+              hash = Fnv1.next(hash, byte)
+              word.add(byte)
             } else if (A <= byte && byte <= Z) {
-              val _ = word.add((byte ^ 0x020).toByte)
+              byte = (byte | 0x20).toByte
+              hash = Fnv1.next(hash, byte)
+              word.add(byte)
             } else if (!word.isEmpty) {
-              val _ = words.add(bal2String(word))
+              dict.register(hash, word.toArray(new Array[Byte](word.size())))
+              word.clear()
+              hash = Fnv1.H
             }
           }
 
-          Pull.output(Chunk.seq(words.getArray)) >> loop(s, word)
+          loop(nxt, dict, hash, word)
       }
 
-    loop(bytes, new ByteArrayList(16)).stream
+    loop(buffers, FrequencyDict(), Fnv1.H, new ByteArrayList(256)).stream
   }
+
 }

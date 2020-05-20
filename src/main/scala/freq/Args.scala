@@ -1,35 +1,41 @@
 package freq
 
 import java.io._
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.Paths
 
-import cats.data.{ NonEmptyList, ValidatedNel }
-import cats.effect.{ Blocker, ContextShift, Sync }
+import cats.data.{NonEmptyList, ValidatedNel}
+import cats.effect.{Blocker, ContextShift, Sync}
 import cats.implicits._
 import com.monovore.decline._
 import fs2._
-import it.unimi.dsi.fastutil.io.FastBufferedInputStream
 
 final case class Args(in: Option[File], out: Option[File], chunkSize: Int, bufferSize: Option[Int]) {
-
-  def input[F[_]](blocker: Blocker)(implicit F: Sync[F], CS: ContextShift[F]): Stream[F, Byte] =
+  def input[F[_]](blocker: Blocker)(implicit F: Sync[F], CS: ContextShift[F]): Stream[F, ByteBuffer] =
     in.map { file =>
-        val fis = F
-          .catchNonFatal {
-            bufferSize
-              .map { size =>
-                new FastBufferedInputStream(new FileInputStream(file), size)
-              }
-              .getOrElse {
-                new FastBufferedInputStream(new FileInputStream(file))
-              }
+        Stream
+          .bracket {
+            blocker.delay(new FileInputStream(file).getChannel)
+          } { channel =>
+            blocker.delay(channel.close())
           }
-          .widen[InputStream]
-        io.readInputStream(fis, chunkSize, blocker)
+          .flatMap { channel =>
+            Stream.unfoldEval(0L -> math.min(channel.size(), Int.MaxValue.toLong)) {
+              case (_, 0L) => F.pure(none[(ByteBuffer, (Long, Long))])
+              case (p, sz) =>
+                val size = math.min(sz, Int.MaxValue.toLong)
+                blocker
+                  .delay(channel.map(FileChannel.MapMode.READ_ONLY, p, size))
+                  .widen[ByteBuffer]
+                  .tupleRight((p + size) -> (channel.size() - p - size))
+                  .map(_.some)
+            }
+          }
       }
       .getOrElse {
-        io.stdin(chunkSize, blocker)
+        io.stdin(chunkSize, blocker).chunks.map(_.toByteBuffer)
       }
 
   def output[F[_]](blocker: Blocker)(implicit F: Sync[F], CS: ContextShift[F]): Pipe[F, String, Unit] = { lines =>
